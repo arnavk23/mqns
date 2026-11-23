@@ -9,7 +9,7 @@ from mqns.network.ll.counter import LinkLayerCounters
 from mqns.network.ll.entangle import LLEntangleProc, LLGroup, LLNotifyEvent, ReserveMsg
 from mqns.network.ll.entangle_2nd import LLNotify2ndEvent
 from mqns.network.ll.event import LLActivateEvent, OnAttemptSuccess, QubitReleasedEvent
-from mqns.simulator import Event, EventHandleSlot, Time, func_to_event
+from mqns.simulator import Event, EventHandleSlot, Time
 from mqns.utils import AutoIncrementIdentifier, unwrap, unwrap_cast
 
 if TYPE_CHECKING:
@@ -41,11 +41,11 @@ class LLEntangleProcPri(LLEntangleProc["LLGroupPri"]):
         )
         """Minimum spacing between adjacent attempts on this channel, None means unlimited."""
 
-        self.attempting: Final[dict[_EntangleTask, LLGroupPri]] = {}
+        self.attempting: Final[dict[_EntangleTask, _ThrottleState]] = {}
         """
         Accepted reservations whose successful attempt has not started, used only under attempt rate throttling.
         Key is EntangleTask record, in insertion order.
-        Value is the group that the reservation belongs to.
+        Value is the throttling state of the reservation.
         """
 
         la = self.ch.link_arch
@@ -84,19 +84,24 @@ class LLEntangleProcPri(LLEntangleProc["LLGroupPri"]):
         """
         Add an accepted reservation under attempt rate throttling.
         """
-        self.attempting[task] = grp
+        self.attempting[task] = _ThrottleState(grp)
         self._throttle_rebalance()
 
-    def throttle_remove(self, tasks: "Iterable[_EntangleTask]") -> None:
+    def throttle_remove(self, tasks: "Iterable[_EntangleTask]", *, cancel=True) -> None:
         """
-        Remove reservations from attempt rate throttling, before their successful attempts start.
+        Remove reservations from attempt rate throttling.
+
+        Args:
+            tasks: reservations to remove; those not under attempt rate throttling are ignored.
+            cancel: whether to cancel the pending successful attempt.
 
         Remaining reservations may attempt more frequently.
         """
         changed = False
         for task in tasks:
             if self.attempting.pop(task, None) is not None:
-                task.throttle_event.cancel()
+                if cancel:
+                    task.success_event.cancel()
                 changed = True
         if changed:
             self._throttle_rebalance()
@@ -115,31 +120,22 @@ class LLEntangleProcPri(LLEntangleProc["LLGroupPri"]):
         now = self.simulator.tc
         interval = max(self.ch.link_arch.attempt_interval, self.min_attempt_spacing * len(self.attempting))
 
-        for task in self.attempting:
-            if task.interval.slot > 0:
-                task.progress += (now.slot - task.t_progress.slot) / task.interval.slot
-            elif task.interval is not Time.SENTINEL:
-                task.progress = task.k - 1
-            task.t_progress = now
-            task.interval = interval
+        for task, st in self.attempting.items():
+            if st.interval.slot > 0:
+                st.progress += (now.slot - st.t_progress.slot) / st.interval.slot
+            elif st.interval is not Time.SENTINEL:
+                st.progress = task.k - 1
+            st.t_progress = now
+            st.interval = interval
 
-            remaining = max(0.0, task.k - 1 - task.progress)
+            remaining = max(0.0, task.k - 1 - st.progress)
             t_success = now + Time(round(remaining * interval.slot), accuracy=now.accuracy)
-            if (event := task.throttle_event.get()) is not None and event.t == t_success:
+            if (event := task.success_event.get()) is not None and event.t == t_success:
                 continue
-            self.simulator.sched(event := func_to_event(t_success, self._throttle_success, task))
-            task.throttle_event.set(event)
+            self.simulator.sched(event := LLEntangleSuccessEvent(st.grp, task, None, t=t_success))
+            task.success_event.set(event)
 
         self.log_debug("THROTTLE n-attempting=%d interval=%s", len(self.attempting), interval)
-
-    def _throttle_success(self, task: "_EntangleTask") -> None:
-        """
-        Handle the start of the successful attempt under attempt rate throttling.
-        """
-        task.throttle_event.set(None)
-        grp = self.attempting.pop(task)
-        self._throttle_rebalance()
-        grp.prepare_epr(task, self.simulator.tc)
 
 
 class LLGroupPri(LLGroup[LLEntangleProcPri]):
@@ -172,10 +168,7 @@ class LLGroupPri(LLGroup[LLEntangleProcPri]):
         tasks_aborted: list[str] = []
         tasks_uncancelable: list[str] = []
         for key, task in self.oreq_table.items():
-            success_event = task.success_event
-            if success_event is None and (throttle_event := task.throttle_event.get()) is not None:
-                # under attempt rate throttling, successful attempt time is pending
-                success_event = throttle_event
+            success_event = task.success_event.get()
             if success_event is None:  # reservation has not completed
                 tasks_aborted.append(key)
             elif success_event.t <= now:  # successful attempt has started or is starting in the same time slot
@@ -250,15 +243,22 @@ class LLGroupPri(LLGroup[LLEntangleProcPri]):
 
         if proc.min_attempt_spacing is None:
             # Without throttling, attempts are spaced by link_arch attempt_interval.
-            self.prepare_epr(task, task.t_reserve + proc.ch.link_arch.attempt_interval * (task.k - 1))
+            t_success = task.t_reserve + proc.ch.link_arch.attempt_interval * (task.k - 1)
+            if (epr := self._prepare_epr(task, t_success)) is not None:
+                proc.simulator.sched(event := LLEntangleSuccessEvent(self, task, epr, t=t_success))
+                task.success_event.set(event)
         else:
             # With throttling, the successful attempt time depends on other concurrent reservations.
             # It is recomputed whenever the set of attempting reservations changes.
+            # EPR is prepared upon LLEntangleSuccessEvent, when the successful attempt time is final.
             proc.throttle_add(self, task)
 
-    def prepare_epr(self, task: "_EntangleTask", t_success: Time) -> None:
+    def _prepare_epr(self, task: "_EntangleTask", t_success: Time) -> Entanglement | None:
         """
-        Schedule the successful attempt, after its start time has been determined.
+        Determine notification times and create EPR, after the successful attempt time has been determined.
+
+        Returns:
+            EPR, or None if the notifications would exceed beyond EXTERNAL phase.
         """
         proc = self.proc
         la = proc.ch.link_arch
@@ -277,13 +277,10 @@ class LLGroupPri(LLGroup[LLEntangleProcPri]):
                 task.t_notify_pri,
                 task.t_notify_2nd,
             )
-            return
+            return None
 
-        # Create EPR and schedule success event.
-        # EPR is created here instead of in .attempt_success() so that epr.name can be logged together.
+        # EPR is created here so that epr.name can be logged together.
         epr = la.make_epr(t_success, proc.node, proc.peer, key=task.key)
-        task.success_event = LLEntangleSuccessEvent(self, task, epr, t=t_success)
-        proc.simulator.sched(task.success_event)
         self.log_debug(
             "%s EPR_PREPARE epr=%s t_success=%s t_notify=%s,%s",
             task,
@@ -292,13 +289,25 @@ class LLGroupPri(LLGroup[LLEntangleProcPri]):
             task.t_notify_pri,
             task.t_notify_2nd,
         )
+        return epr
 
-    def attempt_success(self, task: "_EntangleTask", epr: Entanglement) -> None:
+    def attempt_success(self, task: "_EntangleTask", epr: Entanglement | None) -> None:
         """
         Start the successful attempt.
 
         Invoked by :py:class:`LLEntangleSuccessEvent`.
+
+        Args:
+            task: the reservation.
+            epr: prepared EPR, or None under attempt rate throttling.
         """
+        if epr is None:
+            # Under attempt rate throttling, the successful attempt time is final now.
+            # Remaining reservations may attempt more frequently.
+            self.proc.throttle_remove((task,), cancel=False)
+            if (epr := self._prepare_epr(task, self.proc.simulator.tc)) is None:
+                return
+
         self.on_attempt_success(self.proc.ch, self.proc.peer, self.gid, epr)
 
         # Schedule EPR delivery events on both nodes.
@@ -341,7 +350,7 @@ class LLEntangleSuccessEvent(Event):
         self,
         grp: LLGroupPri,
         task: "_EntangleTask",
-        epr: Entanglement,
+        epr: Entanglement | None,
         *,
         t: Time,
     ):
@@ -406,32 +415,16 @@ class _EntangleTask:
     Time point to notify the secondary node of successful entanglement.
     ``Time.SENTINEL`` means the reservation has not been accepted.
     """
-    success_event: LLEntangleSuccessEvent | None = None
+    success_event: Final[EventHandleSlot[LLEntangleSuccessEvent]]
     """
     Event to start successful attempt.
-    ``None`` means the reservation has not been accepted, the successful attempt time is not yet determined
-    under attempt rate throttling, or the notifications would exceed beyond EXTERNAL phase.
-    """
-    progress: float = 0.0
-    """
-    Number of attempts made as of ``t_progress``, used only under attempt rate throttling.
-    """
-    t_progress: Time = Time.SENTINEL
-    """
-    Time point when ``progress`` was last updated, used only under attempt rate throttling.
-    """
-    interval: Time = Time.SENTINEL
-    """
-    Current interval between adjacent attempts, used only under attempt rate throttling.
-    """
-    throttle_event: Final[EventHandleSlot]
-    """
-    Event to determine the start of successful attempt, used only under attempt rate throttling.
+    Empty means the reservation has not been accepted or the notifications would exceed beyond EXTERNAL phase.
+    Under attempt rate throttling, the event is rescheduled whenever the set of attempting reservations changes.
     """
 
     def __init__(self, mq: MemoryQubit):
         self.mq = mq
-        self.throttle_event = EventHandleSlot()
+        self.success_event = EventHandleSlot()
 
     @property
     def key(self) -> str:
@@ -439,3 +432,21 @@ class _EntangleTask:
 
     def __repr__(self) -> str:
         return f"EntangleTask({self.key}, k={self.k}, t_reserve={self.t_reserve})"
+
+
+class _ThrottleState:
+    """
+    Attempt rate throttling state of one accepted reservation.
+    """
+
+    __slots__ = ("grp", "interval", "progress", "t_progress")
+
+    def __init__(self, grp: LLGroupPri):
+        self.grp: Final = grp
+        """Group that the reservation belongs to."""
+        self.progress = 0.0
+        """Number of attempts made as of ``t_progress``."""
+        self.t_progress = Time.SENTINEL
+        """Time point when ``progress`` was last updated."""
+        self.interval = Time.SENTINEL
+        """Current interval between adjacent attempts."""
